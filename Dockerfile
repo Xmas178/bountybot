@@ -28,6 +28,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy project files
 COPY . /app/
 
+# Force copy settings.py to ensure it's up to date
+COPY bountybot/settings.py /app/bountybot/settings.py
+
 # Expose port for Django development server
 EXPOSE 8000
 

@@ -47,6 +47,11 @@ INSTALLED_APPS = [
     "corsheaders",
     "django_celery_beat",
     "django_celery_results",
+    # BountyBot apps
+    "common.apps.CommonConfig",
+    "targets.apps.TargetsConfig",
+    "scans.apps.ScansConfig",
+    "findings.apps.FindingsConfig",
 ]
 
 MIDDLEWARE = [
