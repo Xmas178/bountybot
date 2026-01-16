@@ -104,6 +104,73 @@ Access admin panel at: http://localhost:8000/admin
 # Stop PostgreSQL and Redis
 docker compose down
 ```
+## CLI Commands
+
+### Installation
+
+Install BountyBot CLI in development mode:
+```bash
+pip install -e .
+```
+
+### Quick Start
+```bash
+# Add a target
+bountybot target add example.com --name "Example Inc" --type domain
+
+# Start a scan
+bountybot scan start 1 --profile deep
+
+# Check scan status
+bountybot scan status 1
+
+# List findings
+bountybot finding list --scan 1
+```
+
+### Available Commands
+
+#### Target Management
+- `bountybot target add <value>` - Add new target (domain, IP, or URL)
+- `bountybot target list` - List all targets
+- `bountybot target delete <id>` - Delete target
+
+#### Scan Management
+- `bountybot scan start <target_id>` - Start security scan
+- `bountybot scan list` - List all scans
+- `bountybot scan status <scan_id>` - Check scan status
+
+#### Finding Management
+- `bountybot finding add <scan_id>` - Add finding manually
+- `bountybot finding list` - List all findings
+- `bountybot finding show <finding_id>` - Show finding details
+
+#### General
+- `bountybot version` - Show version information
+- `bountybot --help` - Show help for all commands
+- `bountybot <command> --help` - Show command-specific help
+
+### CLI Examples
+```bash
+# Add multiple targets
+bountybot target add api.example.com --name "API Server" --type url
+bountybot target add 192.168.1.100 --name "Internal Server" --type ip
+
+# Run different scan profiles
+bountybot scan start 1 --profile quick    # Fast reconnaissance only
+bountybot scan start 2 --profile standard # Recon + basic scanning
+bountybot scan start 3 --profile deep     # Full comprehensive scan
+
+# Add findings with different severity levels
+bountybot finding add 1 --title "SQL Injection" --severity critical
+bountybot finding add 1 --title "XSS" --severity high
+bountybot finding add 1 --title "Missing headers" --severity medium
+
+# Filter and search
+bountybot target list --active
+bountybot scan list --target 1 --status running
+bountybot finding list --severity critical --status new
+```
 
 ## Development Workflow
 

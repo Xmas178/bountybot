@@ -8,11 +8,15 @@ Integrates with Django Scan model for database operations.
 import typer
 from rich.console import Console
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn
 from typing import Optional
 from scans.models import Scan
 from targets.models import Target
+from findings.models import Finding
 from datetime import datetime
+from cli.utils.scanners.nmap_scanner import NmapScanner
+from cli.utils.scanners.httpx_prober import HttpxProber
+from django.utils import timezone
+from cli.utils.scanners.subfinder_enum import SubfinderEnumerator
 
 # Initialize Typer app for scan commands
 app = typer.Typer(help="Manage security scans")
@@ -28,13 +32,20 @@ def start_scan(
         "-p",
         help="Scan profile: quick, standard, deep, custom",
     ),
+    execute: bool = typer.Option(
+        False,
+        "--execute",
+        "-e",
+        help="Execute scan immediately (otherwise just creates it)",
+    ),
 ):
     """
     Start a new security scan for a target.
 
     Example:
-        bountybot scan start 1
-        bountybot scan start 1 --profile deep
+        bountybot scan start 1                    # Create scan (pending)
+        bountybot scan start 1 --execute          # Create and run immediately
+        bountybot scan start 1 -p deep --execute  # Deep scan, run now
     """
     try:
         # Get target from database
@@ -50,9 +61,167 @@ def start_scan(
         console.print(f"  Target: {target.name}")
         console.print(f"  Profile: {scan.profile}")
         console.print(f"  Status: [yellow]{scan.status}[/yellow]")
-        console.print(
-            f"\n[dim]Use 'bountybot scan status {scan.id}' to check progress[/dim]"
-        )
+
+        # Execute scan immediately if --execute flag is set
+        if execute:
+            console.print(f"\n[cyan]Executing {profile} scan...[/cyan]")
+
+            # Update scan status to running
+            scan.status = "running"
+            scan.started_at = timezone.now()
+            scan.save()
+
+            try:
+                # Initialize scanners
+                nmap_scanner = NmapScanner()
+                httpx_prober = HttpxProber()
+                subfinder_enum = SubfinderEnumerator()
+
+                # PHASE 0: Subdomain enumeration (only for domains)
+                subdomains = []
+                if target.target_type == "domain":
+                    console.print(f"[cyan]Phase 0: Subdomain enumeration...[/cyan]")
+
+                    try:
+                        subfinder_result = subfinder_enum.enumerate(
+                            target.value, timeout=60
+                        )
+                        subdomains = subfinder_result.subdomains
+                        console.print(f"  Found {len(subdomains)} subdomains")
+
+                        # Create findings for subdomains
+                        for subdomain in subdomains:
+                            Finding.objects.create(
+                                scan=scan,
+                                title=f"Subdomain: {subdomain}",
+                                severity="info",
+                                description=f"Subdomain discovered via passive enumeration",
+                                proof_of_concept=f"Domain: {subdomain}\nParent: {target.value}",
+                                status="new",
+                                affected_url=f"http://{subdomain}",
+                            )
+                    except Exception as e:
+                        console.print(
+                            f"  [yellow]Subdomain enumeration skipped: {str(e)}[/yellow]"
+                        )
+                else:
+                    console.print(
+                        f"[dim]Skipping subdomain enumeration (target is not a domain)[/dim]"
+                    )
+                # PHASE 1: Nmap port scan
+                console.print(f"[cyan]Phase 1: Port scanning with nmap...[/cyan]")
+
+                if profile == "quick":
+                    nmap_result = nmap_scanner.scan_quick(target.value)
+                elif profile == "standard":
+                    nmap_result = nmap_scanner.scan_standard(target.value)
+                elif profile == "deep":
+                    nmap_result = nmap_scanner.scan_deep(target.value)
+                else:
+                    raise ValueError(f"Unknown profile: {profile}")
+
+                console.print(f"  Found {len(nmap_result.open_ports)} open ports")
+
+                # Create findings for each open port
+                for port_info in nmap_result.open_ports:
+                    Finding.objects.create(
+                        scan=scan,
+                        title=f"Open Port: {port_info.get('port', 'unknown')} ({port_info.get('service', 'unknown')})",
+                        severity="info",
+                        description=f"Port {port_info.get('port')} is open and running {port_info.get('service', 'unknown service')}",
+                        proof_of_concept=f"Service: {port_info.get('service', 'N/A')}\nProtocol: {port_info.get('protocol', 'tcp')}",
+                        status="new",
+                    )
+
+                # PHASE 2: HTTP probing
+                console.print(f"\n[cyan]Phase 2: Probing HTTP endpoints...[/cyan]")
+
+                # Extract ports that might serve HTTP
+                http_ports = [int(p["port"]) for p in nmap_result.open_ports]
+
+                if http_ports:
+                    httpx_results = httpx_prober.probe_from_ports(
+                        target.value, http_ports
+                    )
+                    console.print(f"  Found {len(httpx_results)} active HTTP endpoints")
+
+                    # Create findings for HTTP endpoints
+                    for http_result in httpx_results:
+                        # Determine severity based on findings
+                        severity = "info"
+
+                        # Build description
+                        description = f"HTTP endpoint is alive and responding.\n"
+                        description += f"Status Code: {http_result.status_code}\n"
+                        if http_result.title:
+                            description += f"Page Title: {http_result.title}\n"
+                        if http_result.webserver:
+                            description += f"Web Server: {http_result.webserver}\n"
+                        if http_result.tech_stack:
+                            description += (
+                                f"Technologies: {', '.join(http_result.tech_stack)}\n"
+                            )
+
+                        # Build proof of concept
+                        poc = f"URL: {http_result.url}\n"
+                        poc += f"Status: {http_result.status_code}\n"
+                        if http_result.content_length:
+                            poc += (
+                                f"Content Length: {http_result.content_length} bytes\n"
+                            )
+                        if http_result.tech_stack:
+                            poc += f"Tech Stack:\n"
+                            for tech in http_result.tech_stack:
+                                poc += f"  - {tech}\n"
+
+                        Finding.objects.create(
+                            scan=scan,
+                            title=f"HTTP Endpoint: {http_result.url}",
+                            severity=severity,
+                            description=description.strip(),
+                            proof_of_concept=poc.strip(),
+                            status="new",
+                            affected_url=http_result.url,
+                        )
+                else:
+                    console.print(f"  No HTTP ports to probe")
+
+                # Update scan summary counts
+                total_findings = Finding.objects.filter(scan=scan).count()
+                scan.findings_count = total_findings
+                scan.info_count = total_findings
+
+                # Update scan as completed
+                scan.status = "completed"
+                scan.completed_at = timezone.now()
+                scan.notes = f"Found {len(nmap_result.open_ports)} open ports, {len(httpx_results) if http_ports else 0} HTTP endpoints"
+                scan.save()
+
+                console.print(f"\n[bold green]✓[/bold green] Scan completed!")
+                console.print(
+                    f"  Open Ports: [cyan]{len(nmap_result.open_ports)}[/cyan]"
+                )
+                console.print(
+                    f"  HTTP Endpoints: [cyan]{len(httpx_results) if http_ports else 0}[/cyan]"
+                )
+                console.print(f"  Total Findings: [cyan]{total_findings}[/cyan]")
+                console.print(f"  Duration: {scan.completed_at - scan.started_at}")
+
+            except Exception as e:
+                # Mark scan as failed
+                scan.status = "failed"
+                scan.completed_at = timezone.now()
+                scan.notes = f"Error: {str(e)}"
+                scan.save()
+
+                console.print(f"[bold red]✗[/bold red] Scan failed: {str(e)}")
+                raise typer.Exit(code=1)
+        else:
+            console.print(f"\n[dim]Scan created but not executed.[/dim]")
+            console.print(
+                f"[dim]Run with --execute flag to start scan immediately[/dim]"
+            )
+            console.print(f"[dim]Or use: bountybot scan status {scan.id}[/dim]")
 
     except Target.DoesNotExist:
         console.print(f"[bold red]✗[/bold red] Target with ID {target_id} not found.")
@@ -61,6 +230,9 @@ def start_scan(
     except Exception as e:
         console.print(f"[bold red]✗[/bold red] Error starting scan: {str(e)}")
         raise typer.Exit(code=1)
+
+
+# (list_scans ja scan_status funktiot tulevat tähän - säilytä ne!)
 
 
 @app.command("list")
