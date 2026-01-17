@@ -109,7 +109,7 @@ def list_findings(
     table.add_column("Status", justify="center")
     table.add_column("Scan", style="dim")
     table.add_column("Target", style="green")
-    table.add_column("Found", style="dim")
+    table.add_column("Found", style="dim", width=16)
 
     # Add rows
     for finding in findings:
@@ -136,7 +136,11 @@ def list_findings(
             status_display,
             f"#{finding.scan.id}",
             finding.scan.target.name,
-            finding.discovered_at.strftime("%Y-%m-%d"),
+            (
+                finding.discovered_at.strftime("%Y-%m-%d %H:%M")
+                if finding.discovered_at
+                else "-"
+            ),
         )
 
     console.print(table)
