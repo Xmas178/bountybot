@@ -17,6 +17,7 @@ import subprocess
 import json
 from pathlib import Path
 from typing import List, Dict, Optional
+from cli.utils.config import get_output_dir
 
 
 def fuzz_directories(
@@ -54,7 +55,7 @@ def fuzz_directories(
     """
 
     # Create output directory
-    output_dir = Path(f"/tmp/bountybot/ffuf/scan_{scan_id}")
+    output_dir = get_output_dir() / "ffuf" / f"scan_{scan_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / "ffuf_results.json"
 

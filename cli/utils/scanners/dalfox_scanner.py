@@ -18,6 +18,7 @@ import subprocess
 import json
 from pathlib import Path
 from typing import List, Dict, Optional
+from cli.utils.config import get_output_dir
 
 
 def test_xss_vulnerabilities(
@@ -51,7 +52,7 @@ def test_xss_vulnerabilities(
     """
 
     # Create output directory
-    output_dir = Path(f"/tmp/bountybot/dalfox/scan_{scan_id}")
+    output_dir = get_output_dir() / "dalfox" / f"scan_{scan_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / "dalfox_results.json"
 

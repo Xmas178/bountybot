@@ -20,6 +20,7 @@ import subprocess
 import re
 from pathlib import Path
 from typing import List, Dict, Optional
+from cli.utils.config import get_output_dir
 
 
 def scan_web_vulnerabilities(
@@ -55,7 +56,7 @@ def scan_web_vulnerabilities(
     """
 
     # Create output directory
-    output_dir = Path(f"/tmp/bountybot/nikto/scan_{scan_id}")
+    output_dir = get_output_dir() / "nikto" / f"scan_{scan_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / "nikto_results.txt"
 

@@ -125,9 +125,8 @@ class NmapScanner:
         """
         args = [
             self.nmap_path,
-            "-sS",  # SYN scan
+            "-sT",  # TCP connect scan (no sudo required)
             "-sV",  # Service version detection
-            "-O",  # OS detection
             "-sC",  # Default NSE scripts
             "-p-",  # All ports
             "-T4",  # Aggressive timing

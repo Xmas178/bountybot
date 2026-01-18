@@ -48,12 +48,29 @@ class HttpxProber:
         """
         import os
 
-        # Check ~/go/bin/httpx first (Go install location)
-        go_bin = os.path.expanduser("~/go/bin/httpx")
-        if os.path.exists(go_bin):
-            return go_bin
+        # Try multiple locations in order of preference
+        possible_paths = [
+            "/home/crake178/go/bin/httpx",  # Hardcoded user path (works with sudo)
+            os.path.join(os.environ.get("HOME", ""), "go/bin/httpx"),  # $HOME/go/bin
+            os.path.expanduser("~/go/bin/httpx"),  # ~/go/bin (may fail with sudo)
+        ]
 
-        # Check system PATH
+        # Check each possible location
+        for path in possible_paths:
+            if path and os.path.exists(path) and os.access(path, os.X_OK):
+                # Verify it's the Go version
+                try:
+                    version_check = subprocess.run(
+                        [path, "-version"], capture_output=True, text=True, timeout=5
+                    )
+                    output = version_check.stdout + version_check.stderr
+
+                    if "projectdiscovery" in output:
+                        return path
+                except:
+                    continue
+
+        # Check system PATH as last resort
         try:
             result = subprocess.run(
                 ["which", "httpx"], capture_output=True, text=True, check=True

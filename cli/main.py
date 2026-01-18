@@ -58,7 +58,9 @@ app.add_typer(finding.app, name="finding")
 def version():
     """Show BountyBot version information."""
     console.print("[bold cyan]BountyBot[/bold cyan] v0.1.0")
-    console.print("Automated Security Testing Platform")
+    app = typer.Typer(
+        help="BountyBot - Comprehensive Bug Bounty Reconnaissance & Vulnerability Discovery Platform"
+    )
     console.print("\nDeveloped by: Sami T")
 
 

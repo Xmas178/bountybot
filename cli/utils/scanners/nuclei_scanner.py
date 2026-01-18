@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 from typing import List, Dict, Optional
 from django.utils import timezone
+from cli.utils.config import get_output_dir
 
 
 def run_nuclei_scan(
@@ -52,7 +53,7 @@ def run_nuclei_scan(
     """
 
     # Create output directory for scan results
-    output_dir = Path(f"/tmp/bountybot/nuclei/scan_{scan_id}")
+    output_dir = get_output_dir() / "nuclei" / f"scan_{scan_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / "nuclei_results.json"
 

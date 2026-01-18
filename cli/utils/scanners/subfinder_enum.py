@@ -46,10 +46,21 @@ class SubfinderEnumerator:
         """
         import os
 
-        go_bin = os.path.expanduser("~/go/bin/subfinder")
-        if os.path.exists(go_bin):
-            return go_bin
+        # Try multiple locations in order of preference
+        possible_paths = [
+            "/home/crake178/go/bin/subfinder",  # Hardcoded user path (works with sudo)
+            os.path.join(
+                os.environ.get("HOME", ""), "go/bin/subfinder"
+            ),  # $HOME/go/bin
+            os.path.expanduser("~/go/bin/subfinder"),  # ~/go/bin (may fail with sudo)
+        ]
 
+        # Check each possible location
+        for path in possible_paths:
+            if path and os.path.exists(path) and os.access(path, os.X_OK):
+                return path
+
+        # Check system PATH as last resort
         try:
             result = subprocess.run(
                 ["which", "subfinder"], capture_output=True, text=True, check=True

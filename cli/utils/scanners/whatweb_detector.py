@@ -16,6 +16,7 @@ import subprocess
 import json
 from typing import List, Dict, Optional
 from pathlib import Path
+from cli.utils.config import get_output_dir
 
 
 def detect_technologies(
@@ -60,7 +61,7 @@ def detect_technologies(
     """
 
     # Create output directory
-    output_dir = Path(f"/tmp/bountybot/whatweb/scan_{scan_id}")
+    output_dir = get_output_dir() / "whatweb" / f"scan_{scan_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / "whatweb_results.json"
 

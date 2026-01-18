@@ -17,6 +17,7 @@ import subprocess
 import json
 from pathlib import Path
 from typing import List, Dict, Optional
+from cli.utils.config import get_output_dir
 
 
 def scan_wordpress(
@@ -51,7 +52,7 @@ def scan_wordpress(
     """
 
     # Create output directory
-    output_dir = Path(f"/tmp/bountybot/wpscan/scan_{scan_id}")
+    output_dir = get_output_dir() / "wpscan" / f"scan_{scan_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / "wpscan_results.json"
 

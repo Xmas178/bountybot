@@ -17,10 +17,16 @@ import json
 import re
 from pathlib import Path
 from typing import List, Dict, Optional
+from cli.utils.config import get_output_dir
 
 
 def test_sql_injection(
-    target: str, scan_id: int, level: int = 1, risk: int = 1, timeout: int = 300
+    target: str,
+    scan_id: int,
+    level: int = 1,
+    risk: int = 1,
+    dbms: Optional[str] = None,
+    timeout: int = 300,
 ) -> List[Dict]:
     """
     Test target for SQL injection vulnerabilities using SQLMap.
@@ -57,7 +63,7 @@ def test_sql_injection(
     """
 
     # Create output directory
-    output_dir = Path(f"/tmp/bountybot/sqlmap/scan_{scan_id}")
+    output_dir = get_output_dir() / "sqlmap" / f"scan_{scan_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # SQLMap output files
@@ -88,6 +94,9 @@ def test_sql_injection(
         # T = Time-based blind
         # Q = Inline queries
     ]
+    # Add DBMS if detected from WhatWeb
+    if dbms:
+        cmd.extend(["--dbms", dbms])
 
     # Add timeout handling
     cmd.extend(["--timeout", "30"])  # 30s per request timeout
