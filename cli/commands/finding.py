@@ -211,6 +211,72 @@ def show_finding(
         raise typer.Exit(code=1)
 
 
+@app.command("generate-poc")
+def generate_poc(
+    finding_id: int = typer.Argument(..., help="Finding ID to generate PoC for"),
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o", help="Output file path (default: auto-generated)"
+    ),
+    format: str = typer.Option(
+        "python", "--format", "-f", help="PoC format: python, bash, curl, report"
+    ),
+):
+    """
+    Generate Proof of Concept for a finding.
+
+    Creates an executable PoC script or HackerOne report template
+    based on the vulnerability type.
+
+    Example:
+        bountybot finding generate-poc 123
+        bountybot finding generate-poc 123 --format report
+        bountybot finding generate-poc 123 --output exploit.py
+    """
+    from findings.models import Finding
+    from cli.utils.poc_generator import PoCGenerator
+
+    try:
+        # Get finding
+        finding = Finding.objects.get(id=finding_id)
+
+        console.print(f"\n[cyan]🔧 Generating PoC for finding #{finding_id}...[/cyan]")
+        console.print(f"Title: {finding.title}")
+        console.print(f"Severity: [{finding.severity.upper()}]\n")
+
+        # Initialize PoC generator
+        generator = PoCGenerator()
+
+        # Generate PoC
+        poc_result = generator.generate_poc(
+            finding=finding, output_path=output, format=format
+        )
+
+        if poc_result["success"]:
+            console.print(f"[bold green]✓ PoC generated successfully![/bold green]")
+            console.print(f"\n[bold]File:[/bold] {poc_result['file_path']}")
+            console.print(f"[bold]Format:[/bold] {poc_result['format']}")
+
+            if format == "python" or format == "bash":
+                console.print(f"\n[bold]Run:[/bold]")
+                if format == "python":
+                    console.print(f"  python {poc_result['file_path']}")
+                else:
+                    console.print(f"  bash {poc_result['file_path']}")
+
+            console.print(
+                f"\n[dim]Note: Review and customize the PoC before using![/dim]"
+            )
+        else:
+            console.print(f"[red]Failed to generate PoC: {poc_result['error']}[/red]")
+
+    except Finding.DoesNotExist:
+        console.print(f"[red]Error: Finding {finding_id} not found[/red]")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Error generating PoC: {e}[/red]")
+        raise typer.Exit(1)
+
+
 def get_severity_color(severity: str) -> str:
     """Get Rich color for severity level."""
     colors = {

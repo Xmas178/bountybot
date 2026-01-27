@@ -40,7 +40,7 @@ def setup_django():
 setup_django()
 
 # Import command modules
-from cli.commands import target, scan, finding
+from cli.commands import target, scan, finding, analyze
 
 # Create main Typer application
 app = typer.Typer(
@@ -52,6 +52,7 @@ app = typer.Typer(
 app.add_typer(target.app, name="target")
 app.add_typer(scan.app, name="scan")
 app.add_typer(finding.app, name="finding")
+app.add_typer(analyze.app, name="analyze")
 
 
 @app.command()

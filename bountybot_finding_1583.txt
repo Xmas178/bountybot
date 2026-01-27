@@ -1,0 +1,19 @@
+
+Finding #1583
+────────────────────────────────────────────────────────────
+Title: Subdomain: cardmanager.mufgamericas.com
+Severity: INFO
+Status: new
+
+Target: MUFG Americas (mufgamericas.com)
+Scan: #37
+Discovered: 2026-01-18 12:40:43
+
+Description:
+Subdomain discovered via passive enumeration
+
+Proof of Concept:
+Domain: cardmanager.mufgamericas.com
+Parent: mufgamericas.com
+────────────────────────────────────────────────────────────
+

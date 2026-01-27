@@ -8,6 +8,15 @@ Each phase is a separate function for better maintainability.
 from typing import Optional, Dict, List
 from rich.console import Console
 from django.utils import timezone
+from cli.utils.logger import (
+    setup_logger,
+    log_phase_start,
+    log_phase_complete,
+    log_tool_execution,
+    log_tool_success,
+    log_tool_error,
+)
+from cli.utils.error_handler import safe_tool_execution, validate_scan_requirements
 
 console = Console()
 
@@ -26,6 +35,14 @@ def execute_scan(
     """
     Execute complete security scan across all phases.
     """
+    # Setup logger for this scan
+    logger = setup_logger(scan_id=scan.id, log_level="INFO")
+    logger.info(f"Starting {profile} scan for target: {target.value}")
+
+    # Validate required tools
+    logger.info("Validating security tools...")
+    tool_status = validate_scan_requirements(logger=logger)
+
     from findings.models import Finding
 
     console.print(f"\n[cyan]Executing {profile} scan...[/cyan]")
@@ -132,871 +149,700 @@ def execute_scan(
 
         console.print(f"[bold red]✗ Scan failed: {str(e)}[/bold red]")
         raise
-    """
-    Execute complete security scan across all phases.
-
-    Args:
-        scan: Django Scan model instance
-        target: Django Target model instance
-        profile: Scan profile (quick, standard, deep)
-        yes: Auto-accept all prompts
-        sqlmap_level: Custom SQLMap level (1-5)
-        sqlmap_risk: Custom SQLMap risk (1-3)
-        nuclei_severity: Custom Nuclei severity filter
-        ffuf_wordlist: Custom FFuf wordlist
-        nmap_timing: Custom Nmap timing
-    """
-    console.print(f"\n[cyan]Executing {profile} scan...[/cyan]")
-
-    # Update scan status to running
-    scan.status = "running"
-    scan.started_at = timezone.now()
-    scan.save()
-
-    try:
-        # PHASE 0: Subdomain Enumeration
-        subdomains = execute_phase_0_subdomain_enum(scan, target, profile)
-
-        # PHASE 1: Port Scanning
-        nmap_result = execute_phase_1_port_scan(scan, target, profile)
-
-        # PHASE 2: HTTP Probing
-        http_results = execute_phase_2_http_probing(scan, target, nmap_result)
-
-        # PHASE 3: Technology Detection
-        all_technologies = execute_phase_3_tech_detection(
-            scan, target, http_results, profile
-        )
-
-        # TODO: Phases 4-9...
-
-        # Mark scan as completed
-        scan.status = "completed"
-        scan.completed_at = timezone.now()
-        scan.save()
-
-        console.print(f"\n[bold green]✓ Scan completed![/bold green]")
-
-    except Exception as e:
-        scan.status = "failed"
-        scan.completed_at = timezone.now()
-        scan.notes = f"Error: {str(e)}"
-        scan.save()
-
-        console.print(f"[bold red]✗ Scan failed: {str(e)}[/bold red]")
-        raise
 
 
 def execute_phase_0_subdomain_enum(scan, target, profile):
     """
-    Phase 0: Subdomain Enumeration
-
-    Uses Subfinder to discover subdomains for domain targets.
-    Skipped for IP and URL targets.
+    Phase 0: Subdomain Enumeration (domain targets only).
     """
-    from cli.utils.scanners.subfinder_enum import SubfinderEnumerator
+    from cli.utils.scanners.subfinder_enum import enumerate_subdomains
     from findings.models import Finding
 
-    subdomains = []
+    log_phase_start(logger, 0, "Subdomain Enumeration")
 
-    if target.target_type == "domain":
-        console.print(f"[cyan]Phase 0: Subdomain enumeration...[/cyan]")
+    # Skip if target is not a domain
+    if target.target_type != "domain":
+        logger.info("Skipping subdomain enumeration - target is not a domain")
+        console.print("[dim]Skipping subdomain enumeration (not a domain target)[/dim]")
+        log_phase_complete(logger, 0)
+        return []
 
-        try:
-            subfinder_enum = SubfinderEnumerator()
-            subfinder_result = subfinder_enum.enumerate(target.value, timeout=60)
-            subdomains = subfinder_result.subdomains
-            console.print(f"  Found {len(subdomains)} subdomains")
+    # Execute subfinder with error handling
+    def run_subfinder():
+        log_tool_execution(logger, "subfinder", f"subfinder -d {target.value}")
+        return enumerate_subdomains(target.value, scan.id)
 
-            # Create findings for subdomains
-            for subdomain in subdomains:
-                Finding.objects.create(
-                    scan=scan,
-                    title=f"Subdomain: {subdomain}",
-                    severity="info",
-                    description=f"Subdomain discovered via passive enumeration",
-                    proof_of_concept=f"Domain: {subdomain}\nParent: {target.value}",
-                    status="new",
-                    affected_url=f"http://{subdomain}",
-                )
-        except Exception as e:
-            console.print(f"  [yellow]Subdomain enumeration skipped: {str(e)}[/yellow]")
-    else:
-        console.print(
-            f"[dim]Skipping subdomain enumeration (target is not a domain)[/dim]"
+    success, subdomains = safe_tool_execution(
+        func=run_subfinder,
+        tool_name="subfinder",
+        logger=logger,
+        max_retries=2,
+        continue_on_error=True,
+    )
+
+    if not success:
+        logger.warning("Subfinder failed - continuing without subdomain enumeration")
+        log_phase_complete(logger, 0)
+        return []
+
+    # Save subdomains as findings
+    for subdomain in subdomains:
+        Finding.objects.create(
+            scan=scan,
+            title=f"Subdomain discovered: {subdomain}",
+            severity="info",
+            description=f"Subdomain enumeration found: {subdomain}",
+            tool="subfinder",
+            affected_url=subdomain,
         )
 
+    log_tool_success(logger, "subfinder", len(subdomains))
+    console.print(
+        f"[bold]Phase 0 Results:[/bold] {len(subdomains)} subdomains discovered"
+    )
+
+    log_phase_complete(logger, 0)
     return subdomains
 
 
 def execute_phase_1_port_scan(scan, target, profile):
     """
-    Phase 1: Port Scanning with Nmap
-
-    Scans for open ports and running services.
-    Profile determines scan depth and timing.
+    Phase 1: Port Scanning.
     """
-    from cli.utils.scanners.nmap_scanner import NmapScanner
+    from cli.utils.scanners.nmap_scanner import NmapScanner, NmapResult
     from findings.models import Finding
 
-    console.print(f"[cyan]Phase 1: Port scanning with nmap...[/cyan]")
+    log_phase_start(logger, 1, "Port Scanning")
 
-    nmap_scanner = NmapScanner()
+    # Initialize scanner
+    scanner = NmapScanner()
 
-    if profile == "quick":
-        nmap_result = nmap_scanner.scan_quick(target.value)
-    elif profile == "standard":
-        nmap_result = nmap_scanner.scan_standard(target.value)
-    elif profile == "deep":
-        nmap_result = nmap_scanner.scan_deep(target.value)
-    else:
-        raise ValueError(f"Unknown profile: {profile}")
+    # Execute nmap with error handling
+    def run_nmap():
+        log_tool_execution(logger, "nmap", f"nmap {target.value}")
+        return scanner.scan(target.value, profile=profile)
 
-    console.print(f"  Found {len(nmap_result.open_ports)} open ports")
+    success, nmap_result = safe_tool_execution(
+        func=run_nmap,
+        tool_name="nmap",
+        logger=logger,
+        max_retries=2,
+        continue_on_error=True,
+    )
 
-    # Create findings for each open port
+    if not success:
+        logger.warning("Nmap failed - returning empty result")
+        log_phase_complete(logger, 1)
+        return NmapResult(host=target.value, open_ports=[], scan_output="Scan failed")
+
+    # Save port findings
     for port_info in nmap_result.open_ports:
+        port = port_info["port"]
+        service = port_info.get("service", "unknown")
+        version = port_info.get("version", "")
+
+        description = f"Port {port}/{service}"
+        if version:
+            description += f" - {version}"
+
         Finding.objects.create(
             scan=scan,
-            title=f"Open Port: {port_info.get('port', 'unknown')} ({port_info.get('service', 'unknown')})",
+            title=f"Open port: {port}/{service}",
             severity="info",
-            description=f"Port {port_info.get('port')} is open and running {port_info.get('service', 'unknown service')}",
-            proof_of_concept=f"Service: {port_info.get('service', 'N/A')}\nProtocol: {port_info.get('protocol', 'tcp')}",
-            status="new",
+            description=description,
+            tool="nmap",
+            affected_url=f"{target.value}:{port}",
         )
 
+    log_tool_success(logger, "nmap", len(nmap_result.open_ports))
+    console.print(
+        f"[bold]Phase 1 Results:[/bold] {len(nmap_result.open_ports)} open ports"
+    )
+
+    log_phase_complete(logger, 1)
     return nmap_result
 
 
 def execute_phase_2_http_probing(scan, target, nmap_result):
     """
-    Phase 2: HTTP Endpoint Probing
-
-    Uses HTTPx to probe discovered ports for HTTP/HTTPS services.
-    Extracts metadata like titles, web servers, and technologies.
+    Phase 2: HTTP Probing.
     """
-    from cli.utils.scanners.httpx_prober import HttpxProber
+    from cli.utils.scanners.httpx_prober import HttpxProber, HttpxResult
     from findings.models import Finding
 
-    console.print(f"\n[cyan]Phase 2: Probing HTTP endpoints...[/cyan]")
+    log_phase_start(logger, 2, "HTTP Probing")
 
-    # Extract ports that might serve HTTP
-    http_ports = [int(p["port"]) for p in nmap_result.open_ports]
-    httpx_results = []
+    # Build list of URLs to probe
+    urls_to_probe = []
 
-    if http_ports:
-        httpx_prober = HttpxProber()
-        httpx_results = httpx_prober.probe_from_ports(target.value, http_ports)
-        console.print(f"  Found {len(httpx_results)} active HTTP endpoints")
+    # Add target itself
+    urls_to_probe.append(target.value)
 
-        # Create findings for HTTP endpoints
-        for http_result in httpx_results:
-            # Build description
-            description = f"HTTP endpoint is alive and responding.\n"
-            description += f"Status Code: {http_result.status_code}\n"
-            if http_result.title:
-                description += f"Page Title: {http_result.title}\n"
-            if http_result.webserver:
-                description += f"Web Server: {http_result.webserver}\n"
-            if http_result.tech_stack:
-                description += f"Technologies: {', '.join(http_result.tech_stack)}\n"
+    # Add URLs from open ports (if nmap found web ports)
+    for port_info in nmap_result.open_ports:
+        port = port_info["port"]
+        # Common web ports
+        if port in [80, 443, 8000, 8080, 8443, 3000, 5000]:
+            protocol = "https" if port in [443, 8443] else "http"
+            urls_to_probe.append(f"{protocol}://{target.value}:{port}")
 
-            # Build proof of concept
-            poc = f"URL: {http_result.url}\n"
-            poc += f"Status: {http_result.status_code}\n"
-            if http_result.content_length:
-                poc += f"Content Length: {http_result.content_length} bytes\n"
-            if http_result.tech_stack:
-                poc += f"Tech Stack:\n"
-                for tech in http_result.tech_stack:
-                    poc += f"  - {tech}\n"
+    # Initialize prober
+    prober = HttpxProber()
 
-            Finding.objects.create(
-                scan=scan,
-                title=f"HTTP Endpoint: {http_result.url}",
-                severity="info",
-                description=description.strip(),
-                proof_of_concept=poc.strip(),
-                status="new",
-                affected_url=http_result.url,
-            )
-    else:
-        console.print(f"  No HTTP ports to probe")
+    # Execute httpx with error handling
+    def run_httpx():
+        log_tool_execution(logger, "httpx", f"httpx -l {len(urls_to_probe)} URLs")
+        return prober.probe_urls(urls_to_probe)
 
+    success, httpx_results = safe_tool_execution(
+        func=run_httpx,
+        tool_name="httpx",
+        logger=logger,
+        max_retries=2,
+        continue_on_error=True,
+    )
+
+    if not success:
+        logger.warning("HTTPx failed - returning empty results")
+        log_phase_complete(logger, 2)
+        return []
+
+    # Save HTTP findings
+    for result in httpx_results:
+        Finding.objects.create(
+            scan=scan,
+            title=f"Live HTTP endpoint: {result.url}",
+            severity="info",
+            description=f"Status: {result.status_code}, Title: {result.title}",
+            tool="httpx",
+            affected_url=result.url,
+        )
+
+    log_tool_success(logger, "httpx", len(httpx_results))
+    console.print(
+        f"[bold]Phase 2 Results:[/bold] {len(httpx_results)} live HTTP endpoints"
+    )
+
+    log_phase_complete(logger, 2)
     return httpx_results
 
 
 def execute_phase_3_tech_detection(scan, target, httpx_results, profile):
     """
-    Phase 3: Technology Detection with WhatWeb
-
-    Identifies web technologies, CMS, frameworks, and server software.
-    Results are used by later phases (e.g., SQLMap DBMS detection).
+    Phase 3: Technology Detection with WhatWeb.
     """
-    from cli.utils.scanners.whatweb_detector import (
-        detect_technologies,
-        format_technologies_for_finding,
-    )
+    from cli.utils.scanners.whatweb_detector import WhatWebDetector
     from findings.models import Finding
 
-    console.print(f"\n[cyan]Phase 3: Technology detection with WhatWeb...[/cyan]")
+    log_phase_start(logger, 3, "Technology Detection")
 
-    all_technologies = {}
+    if not httpx_results:
+        logger.info("No HTTP endpoints to scan - skipping technology detection")
+        console.print("[dim]No HTTP endpoints found - skipping WhatWeb[/dim]")
+        log_phase_complete(logger, 3)
+        return {}
 
-    if httpx_results:
-        for http_result in httpx_results:
-            whatweb_target = http_result.url
-            console.print(f"  Detecting technologies: {whatweb_target}")
+    # Initialize detector
+    detector = WhatWebDetector()
 
-            try:
-                tech_data = detect_technologies(
-                    target=whatweb_target,
-                    scan_id=scan.id,
-                    aggression=1,  # Passive detection (fast and safe)
-                    timeout=30,
-                )
+    # Build list of URLs
+    urls = [result.url for result in httpx_results]
 
-                # Store technologies for this URL
-                all_technologies[whatweb_target] = tech_data
+    # Execute WhatWeb with error handling
+    def run_whatweb():
+        log_tool_execution(logger, "whatweb", f"whatweb {len(urls)} URLs")
+        return detector.detect_technologies(urls, aggression=1)
 
-                # Create Finding for technology detection
-                if tech_data.get("technologies"):
-                    description = format_technologies_for_finding(tech_data)
+    success, all_technologies = safe_tool_execution(
+        func=run_whatweb,
+        tool_name="whatweb",
+        logger=logger,
+        max_retries=2,
+        continue_on_error=True,
+    )
 
-                    Finding.objects.create(
-                        scan=scan,
-                        title=f"Technology Stack: {whatweb_target}",
-                        severity="info",
-                        description=description,
-                        status="new",
-                        affected_url=whatweb_target,
-                    )
+    if not success:
+        logger.warning("WhatWeb failed - returning empty results")
+        log_phase_complete(logger, 3)
+        return {}
 
-                    console.print(
-                        f"    Found {tech_data.get('plugins_matched', 0)} technologies"
-                    )
+    # Save technology findings
+    for url, technologies in all_technologies.items():
+        if technologies:
+            tech_list = ", ".join(technologies)
+            Finding.objects.create(
+                scan=scan,
+                title=f"Technologies detected: {url}",
+                severity="info",
+                description=f"Detected: {tech_list}",
+                tool="whatweb",
+                affected_url=url,
+            )
 
-            except Exception as e:
-                console.print(
-                    f"    [yellow]Warning: WhatWeb failed for {whatweb_target}: {str(e)}[/yellow]"
-                )
-                continue
+    total_techs = sum(len(techs) for techs in all_technologies.values())
+    log_tool_success(logger, "whatweb", total_techs)
+    console.print(f"[bold]Phase 3 Results:[/bold] {total_techs} technologies detected")
 
+    log_phase_complete(logger, 3)
     return all_technologies
 
 
 def execute_phase_4_nuclei_scan(
-    scan, target, nmap_result, httpx_results, profile, nuclei_severity=None
+    scan, target, nmap_result, httpx_results, profile, nuclei_severity
 ):
     """
-    Phase 4: Nuclei CVE and Vulnerability Scanning
-
-    Scans for known vulnerabilities using 10,000+ templates.
-    Supports severity filtering and profile-based timeouts.
+    Phase 4: Nuclei CVE Scanning.
     """
-    from cli.utils.scanners.nuclei_scanner import run_nuclei_scan
+    from cli.utils.scanners.nuclei_scanner import NucleiScanner
     from findings.models import Finding
-    from urllib.parse import urlparse
 
-    console.print(f"\n[cyan]Phase 4: Vulnerability scanning with nuclei...[/cyan]")
+    log_phase_start(logger, 4, "Nuclei CVE Scanning")
 
-    # Collect all discovered URLs for nuclei scanning
-    scan_targets = []
+    # Build target list (HTTP URLs)
+    if not httpx_results:
+        logger.info("No HTTP endpoints to scan - skipping Nuclei")
+        console.print("[dim]No HTTP endpoints found - skipping Nuclei[/dim]")
+        log_phase_complete(logger, 4)
+        return 0, {}
 
-    # Add main target
-    if target.target_type == "url":
-        scan_targets.append(target.value)
-    elif target.target_type == "domain":
-        # Don't add defaults - let HTTPx discover actual endpoints
-        pass
-    elif target.target_type == "ip":
-        # Add IP with common HTTP ports (only if not discovered by HTTPx)
-        for port_info in nmap_result.open_ports:
-            port = port_info.get("port")
-            if port in [80, 443, 8000, 8080, 8443]:
-                protocol = "https" if port in [443, 8443] else "http"
-                scan_targets.append(f"{protocol}://{target.value}:{port}")
+    urls = [result.url for result in httpx_results]
 
-    # Add discovered HTTP endpoints from Phase 2 (primary source)
-    if httpx_results:
-        for http_result in httpx_results:
-            scan_targets.append(http_result.url)
+    # Initialize scanner
+    scanner = NucleiScanner()
 
-    # Remove duplicates and normalize URLs
-    seen = set()
-    unique_targets = []
+    # Execute Nuclei with error handling
+    def run_nuclei():
+        log_tool_execution(logger, "nuclei", f"nuclei -l {len(urls)} URLs")
+        return scanner.scan(urls=urls, profile=profile, severity_filter=nuclei_severity)
 
-    for url in scan_targets:
-        # Normalize URL (remove default ports)
-        parsed = urlparse(url)
+    success, nuclei_findings = safe_tool_execution(
+        func=run_nuclei,
+        tool_name="nuclei",
+        logger=logger,
+        max_retries=1,  # Nuclei takes long, only 1 retry
+        continue_on_error=True,
+    )
 
-        # Normalize: https://example.com:443 → https://example.com
-        if (parsed.scheme == "https" and parsed.port == 443) or (
-            parsed.scheme == "http" and parsed.port == 80
-        ):
-            normalized = f"{parsed.scheme}://{parsed.hostname}{parsed.path or ''}"
-        else:
-            normalized = url
+    if not success:
+        logger.warning("Nuclei failed - returning empty results")
+        log_phase_complete(logger, 4)
+        return 0, {}
 
-        if normalized not in seen:
-            seen.add(normalized)
-            unique_targets.append(url)
-
-    scan_targets = unique_targets
-    console.print(f"  [dim]Scanning {len(scan_targets)} unique endpoint(s)[/dim]")
-
-    # Run nuclei on each target
-    nuclei_findings_count = 0
+    # Count by severity
     severity_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
 
-    # Increase timeout for deep profile
-    nuclei_timeout = 600 if profile == "deep" else 300  # 10 min vs 5 min
+    # Save Nuclei findings
+    for finding in nuclei_findings:
+        Finding.objects.create(
+            scan=scan,
+            title=finding["name"],
+            severity=finding["severity"],
+            description=finding["description"],
+            tool="nuclei",
+            affected_url=finding["matched_at"],
+            cvss_score=finding.get("cvss_score"),
+        )
+        severity_counts[finding["severity"]] += 1
 
-    for scan_target in scan_targets:
-        console.print(f"  Scanning: {scan_target}")
+    log_tool_success(logger, "nuclei", len(nuclei_findings))
+    console.print(
+        f"[bold]Phase 4 Results:[/bold] {len(nuclei_findings)} CVE findings "
+        f"(C:{severity_counts['critical']} H:{severity_counts['high']} "
+        f"M:{severity_counts['medium']} L:{severity_counts['low']} I:{severity_counts['info']})"
+    )
 
-        try:
-            # Run nuclei with severity filter (if provided)
-            nuclei_findings = run_nuclei_scan(
-                target=scan_target,
-                scan_id=scan.id,
-                severity=nuclei_severity.split(",") if nuclei_severity else None,
-                timeout=nuclei_timeout,
-            )
-
-            # Create Finding objects in database
-            for finding_data in nuclei_findings:
-                Finding.objects.create(
-                    scan=scan,
-                    title=finding_data["title"],
-                    severity=finding_data["severity"],
-                    description=finding_data["description"],
-                    proof_of_concept=finding_data.get("proof_of_concept"),
-                    status="new",
-                    affected_url=scan_target,
-                )
-
-                # Count by severity
-                severity_counts[finding_data["severity"]] += 1
-                nuclei_findings_count += 1
-
-        except Exception as e:
-            console.print(
-                f"    [yellow]Warning: Nuclei scan failed for {scan_target}: {str(e)}[/yellow]"
-            )
-            continue
-
-    console.print(f"  Found {nuclei_findings_count} vulnerabilities")
-    if nuclei_findings_count > 0:
-        console.print(f"    Critical: [red]{severity_counts['critical']}[/red]")
-        console.print(f"    High: [yellow]{severity_counts['high']}[/yellow]")
-        console.print(f"    Medium: [blue]{severity_counts['medium']}[/blue]")
-        console.print(f"    Low: [dim]{severity_counts['low']}[/dim]")
-        console.print(f"    Info: [dim]{severity_counts['info']}[/dim]")
-
-    return nuclei_findings_count, severity_counts
+    log_phase_complete(logger, 4)
+    return len(nuclei_findings), severity_counts
 
 
 def execute_phase_5_sqlmap_test(
-    scan, httpx_results, all_technologies, profile, sqlmap_level=None, sqlmap_risk=None
+    scan, httpx_results, all_technologies, profile, sqlmap_level, sqlmap_risk
 ):
     """
-    Phase 5: SQL Injection Testing with SQLMap
-
-    Tests for SQL injection vulnerabilities.
-    Uses WhatWeb data to detect DBMS for faster testing.
+    Phase 5: SQL Injection Testing with SQLMap.
     """
-    from cli.utils.scanners.sqlmap_tester import test_sql_injection
+    from cli.utils.scanners.sqlmap_tester import SqlmapTester
     from findings.models import Finding
 
-    console.print(f"\n[cyan]Phase 5: SQL injection testing with SQLMap...[/cyan]")
+    log_phase_start(logger, 5, "SQL Injection Testing")
 
-    sqlmap_targets = []
+    if not httpx_results:
+        logger.info("No HTTP endpoints to test - skipping SQLMap")
+        console.print("[dim]No HTTP endpoints found - skipping SQLMap[/dim]")
+        log_phase_complete(logger, 5)
+        return 0
 
-    # Collect HTTP endpoints
-    if httpx_results:
-        for http_result in httpx_results:
-            sqlmap_targets.append(http_result.url)
+    # Build URL list
+    urls = [result.url for result in httpx_results]
 
-    sqlmap_findings_count = 0
+    # Auto-detect DBMS from WhatWeb results
+    dbms_hint = None
+    for url, technologies in all_technologies.items():
+        for tech in technologies:
+            tech_lower = tech.lower()
+            if "mysql" in tech_lower:
+                dbms_hint = "MySQL"
+                break
+            elif "postgres" in tech_lower:
+                dbms_hint = "PostgreSQL"
+                break
+            elif "mssql" in tech_lower or "sql server" in tech_lower:
+                dbms_hint = "Microsoft SQL Server"
+                break
+            elif "oracle" in tech_lower:
+                dbms_hint = "Oracle"
+                break
+        if dbms_hint:
+            break
 
-    # Determine SQLMap level based on scan profile or custom parameter
-    if sqlmap_level is None:
-        sqlmap_level = 1  # Default
-        if profile == "standard":
-            sqlmap_level = 2  # Test cookies too
-        elif profile == "deep":
-            sqlmap_level = 3  # Test cookies + User-Agent
+    if dbms_hint:
+        logger.info(f"Auto-detected DBMS: {dbms_hint}")
+        console.print(f"[cyan]Auto-detected DBMS: {dbms_hint}[/cyan]")
 
-    # Determine SQLMap risk (default 1, or use custom parameter)
-    if sqlmap_risk is None:
-        sqlmap_risk = 1  # Always safe by default
+    # Initialize tester
+    tester = SqlmapTester()
 
-    for sqlmap_target in sqlmap_targets:
-        console.print(f"  Testing: {sqlmap_target} (level {sqlmap_level})")
-
-        try:
-            # Detect DBMS from WhatWeb data if available
-            detected_dbms = None
-            if sqlmap_target in all_technologies:
-                tech_data = all_technologies[sqlmap_target]
-                technologies = tech_data.get("technologies", {})
-
-                # Check for database technologies
-                for tech_name in technologies.keys():
-                    tech_lower = tech_name.lower()
-                    if "mysql" in tech_lower:
-                        detected_dbms = "MySQL"
-                    elif "postgresql" in tech_lower or "postgres" in tech_lower:
-                        detected_dbms = "PostgreSQL"
-                    elif "microsoft sql" in tech_lower or "mssql" in tech_lower:
-                        detected_dbms = "Microsoft SQL Server"
-                    elif "oracle" in tech_lower:
-                        detected_dbms = "Oracle"
-                    elif "sqlite" in tech_lower:
-                        detected_dbms = "SQLite"
-
-            if detected_dbms:
-                console.print(f"    [dim]Detected DBMS: {detected_dbms}[/dim]")
-
-            # Run SQLMap
-            sqlmap_findings = test_sql_injection(
-                target=sqlmap_target,
-                scan_id=scan.id,
-                level=sqlmap_level,
-                risk=sqlmap_risk,
-                dbms=detected_dbms,
-                timeout=600,  # 10 minutes
-            )
-
-            # Create Finding objects in database
-            for finding_data in sqlmap_findings:
-                Finding.objects.create(
-                    scan=scan,
-                    title=finding_data["title"],
-                    severity=finding_data["severity"],
-                    description=finding_data["description"],
-                    proof_of_concept=finding_data.get("proof_of_concept"),
-                    status="new",
-                    affected_url=sqlmap_target,
-                )
-                sqlmap_findings_count += 1
-
-            if sqlmap_findings:
-                console.print(
-                    f"    [red]⚠️  Found {len(sqlmap_findings)} SQL injection vulnerabilities![/red]"
-                )
-            else:
-                console.print(f"    [green]✓ No SQL injection found[/green]")
-
-        except Exception as e:
-            console.print(
-                f"    [yellow]Warning: SQLMap failed for {sqlmap_target}: {str(e)}[/yellow]"
-            )
-            continue
-
-    if sqlmap_findings_count > 0:
-        console.print(
-            f"\n[bold red]🚨 CRITICAL: {sqlmap_findings_count} SQL injection vulnerabilities detected![/bold red]"
+    # Execute SQLMap with error handling
+    def run_sqlmap():
+        log_tool_execution(logger, "sqlmap", f"sqlmap {len(urls)} URLs")
+        return tester.test_urls(
+            urls=urls,
+            profile=profile,
+            dbms=dbms_hint,
+            level=sqlmap_level,
+            risk=sqlmap_risk,
         )
 
-    return sqlmap_findings_count
+    success, sqlmap_findings = safe_tool_execution(
+        func=run_sqlmap,
+        tool_name="sqlmap",
+        logger=logger,
+        max_retries=1,  # SQLMap takes long, only 1 retry
+        continue_on_error=True,
+    )
+
+    if not success:
+        logger.warning("SQLMap failed - returning empty results")
+        log_phase_complete(logger, 5)
+        return 0
+
+    # Save SQLMap findings
+    for finding in sqlmap_findings:
+        Finding.objects.create(
+            scan=scan,
+            title=finding["title"],
+            severity=finding["severity"],
+            description=finding["description"],
+            tool="sqlmap",
+            affected_url=finding["url"],
+        )
+
+    log_tool_success(logger, "sqlmap", len(sqlmap_findings))
+    console.print(
+        f"[bold]Phase 5 Results:[/bold] {len(sqlmap_findings)} SQL injection vulnerabilities"
+    )
+
+    log_phase_complete(logger, 5)
+    return len(sqlmap_findings)
 
 
 def execute_phase_6_xss_detection(scan, httpx_results):
     """
-    Phase 6: XSS Detection with Dalfox
-
-    Tests for Cross-Site Scripting vulnerabilities.
+    Phase 6: XSS Detection with Dalfox.
     """
-    from cli.utils.scanners.dalfox_scanner import test_xss_vulnerabilities
+    from cli.utils.scanners.dalfox_scanner import DalfoxScanner
     from findings.models import Finding
 
-    console.print(f"\n[cyan]Phase 6: XSS detection with Dalfox...[/cyan]")
-
-    dalfox_targets = []
-
-    if httpx_results:
-        for http_result in httpx_results:
-            dalfox_targets.append(http_result.url)
-
-    dalfox_findings_count = 0
-
-    for dalfox_target in dalfox_targets:
-        console.print(f"  Testing: {dalfox_target}")
-
-        try:
-            # Run Dalfox XSS detection
-            dalfox_findings = test_xss_vulnerabilities(
-                target=dalfox_target,
-                scan_id=scan.id,
-                mode="url",
-                timeout=600,  # 10 minutes
-            )
-
-            # Create Finding objects in database
-            for finding_data in dalfox_findings:
-                Finding.objects.create(
-                    scan=scan,
-                    title=finding_data["title"],
-                    severity=finding_data["severity"],
-                    description=finding_data["description"],
-                    proof_of_concept=finding_data.get("proof_of_concept"),
-                    status="new",
-                    affected_url=dalfox_target,
-                )
-                dalfox_findings_count += 1
-
-            if dalfox_findings:
-                console.print(
-                    f"    [red]⚠️  Found {len(dalfox_findings)} XSS vulnerabilities![/red]"
-                )
-            else:
-                console.print(f"    [green]✓ No XSS vulnerabilities found[/green]")
-
-        except Exception as e:
-            console.print(
-                f"    [yellow]Warning: Dalfox failed for {dalfox_target}: {str(e)}[/yellow]"
-            )
-            continue
-
-    if dalfox_findings_count > 0:
-        console.print(
-            f"\n[bold red]🚨 CRITICAL: {dalfox_findings_count} XSS vulnerabilities detected![/bold red]"
-        )
-
-    return dalfox_findings_count
-
-
-def execute_phase_7_nikto_scan(scan, httpx_results, profile, yes=False):
-    """
-    Phase 7: Nikto Web Server Scanning
-
-    Scans for web server vulnerabilities and misconfigurations.
-    Optional - asks user confirmation unless --yes flag is used.
-    """
-    import typer
-    from cli.utils.scanners.nikto_scanner import scan_web_vulnerabilities
-    from findings.models import Finding
-    from urllib.parse import urlparse
-
-    nikto_findings_count = 0
-
-    if profile == "quick":
-        console.print(
-            f"\n[dim]Skipping Nikto scan in quick profile (use --profile standard for web server testing)[/dim]"
-        )
-        return nikto_findings_count
+    log_phase_start(logger, 6, "XSS Detection")
 
     if not httpx_results:
-        return nikto_findings_count
+        logger.info("No HTTP endpoints to test - skipping Dalfox")
+        console.print("[dim]No HTTP endpoints found - skipping Dalfox[/dim]")
+        log_phase_complete(logger, 6)
+        return 0
 
-    console.print(f"\n[cyan]Phase 7: Web server scanning with Nikto...[/cyan]")
+    # Build URL list
+    urls = [result.url for result in httpx_results]
 
-    # Estimate scan time
-    if profile == "standard":
-        time_per_endpoint = "5-10 minutes"
-        max_time = 10
-    else:  # deep
-        time_per_endpoint = "15-30 minutes"
-        max_time = 30
+    # Initialize scanner
+    scanner = DalfoxScanner()
 
-    total_endpoints = len(httpx_results)
+    # Execute Dalfox with error handling
+    def run_dalfox():
+        log_tool_execution(logger, "dalfox", f"dalfox {len(urls)} URLs")
+        return scanner.scan_urls(urls)
 
-    console.print(
-        f"  [yellow]⚠️  Nikto scan takes {time_per_endpoint} per endpoint.[/yellow]"
+    success, dalfox_findings = safe_tool_execution(
+        func=run_dalfox,
+        tool_name="dalfox",
+        logger=logger,
+        max_retries=2,
+        continue_on_error=True,
     )
+
+    if not success:
+        logger.warning("Dalfox failed - returning empty results")
+        log_phase_complete(logger, 6)
+        return 0
+
+    # Save Dalfox findings
+    for finding in dalfox_findings:
+        Finding.objects.create(
+            scan=scan,
+            title=finding["title"],
+            severity=finding["severity"],
+            description=finding["description"],
+            tool="dalfox",
+            affected_url=finding["url"],
+        )
+
+    log_tool_success(logger, "dalfox", len(dalfox_findings))
     console.print(
-        f"  [yellow]Found {total_endpoints} HTTP endpoint(s) to scan.[/yellow]"
+        f"[bold]Phase 6 Results:[/bold] {len(dalfox_findings)} XSS vulnerabilities"
     )
 
-    # Ask user for confirmation (or auto-accept with --yes)
-    if yes:
-        run_nikto = True
-        console.print("  [dim]Auto-accepting Nikto scan (--yes flag)[/dim]")
-    else:
-        run_nikto = typer.confirm("  Run Nikto web server scan?", default=False)
-
-    if run_nikto:
-        console.print(f"  [cyan]Starting Nikto scan (this will take a while)...[/cyan]")
-
-        for http_result in httpx_results:
-            # Parse URL to get host and port
-            parsed = urlparse(http_result.url)
-            host = parsed.hostname
-            port = parsed.port or (443 if parsed.scheme == "https" else 80)
-            use_ssl = parsed.scheme == "https"
-
-            console.print(f"  Testing: {http_result.url}")
-
-            try:
-                # Run Nikto scan
-                nikto_findings = scan_web_vulnerabilities(
-                    target=host,
-                    scan_id=scan.id,
-                    port=port,
-                    ssl=use_ssl,
-                    timeout=max_time * 60,  # Convert to seconds
-                )
-
-                # Create Finding objects in database
-                for finding_data in nikto_findings:
-                    Finding.objects.create(
-                        scan=scan,
-                        title=finding_data["title"],
-                        severity=finding_data["severity"],
-                        description=finding_data["description"],
-                        proof_of_concept=finding_data.get("proof_of_concept"),
-                        status="new",
-                        affected_url=http_result.url,
-                    )
-                    nikto_findings_count += 1
-
-                if nikto_findings:
-                    console.print(
-                        f"    [yellow]⚠️  Found {len(nikto_findings)} issues![/yellow]"
-                    )
-                else:
-                    console.print(f"    [green]✓ No significant issues found[/green]")
-
-            except Exception as e:
-                console.print(
-                    f"    [yellow]Warning: Nikto failed for {http_result.url}: {str(e)}[/yellow]"
-                )
-                continue
-
-        if nikto_findings_count > 0:
-            console.print(
-                f"\n[bold yellow]⚠️  Nikto found {nikto_findings_count} web server issues![/bold yellow]"
-            )
-    else:
-        console.print(f"  [dim]Nikto scan skipped by user[/dim]")
-
-    return nikto_findings_count
+    log_phase_complete(logger, 6)
+    return len(dalfox_findings)
 
 
-def execute_phase_8_ffuf_fuzzing(
-    scan, httpx_results, profile, yes=False, ffuf_wordlist=None
-):
+def execute_phase_7_nikto_scan(scan, httpx_results, profile, yes):
     """
-    Phase 8: FFuf Directory/File Fuzzing
-
-    Discovers hidden directories and files.
-    Optional - asks user confirmation unless --yes flag is used.
+    Phase 7: Nikto Web Server Scanning.
     """
-    import typer
-    from cli.utils.scanners.ffuf_fuzzer import fuzz_directories
+    from cli.utils.scanners.nikto_scanner import NiktoScanner
     from findings.models import Finding
 
-    ffuf_findings_count = 0
-
-    if profile == "quick":
-        console.print(
-            f"\n[dim]Skipping FFuf fuzzing in quick profile (use --profile standard for directory discovery)[/dim]"
-        )
-        return ffuf_findings_count
+    log_phase_start(logger, 7, "Nikto Web Server Scanning")
 
     if not httpx_results:
-        return ffuf_findings_count
+        logger.info("No HTTP endpoints to scan - skipping Nikto")
+        console.print("[dim]No HTTP endpoints found - skipping Nikto[/dim]")
+        log_phase_complete(logger, 7)
+        return 0
 
-    console.print(f"\n[cyan]Phase 8: Directory/file fuzzing with FFuf...[/cyan]")
+    # Skip Nikto for quick profile
+    if profile == "quick":
+        logger.info("Quick profile - skipping Nikto")
+        console.print("[dim]Quick profile - skipping Nikto[/dim]")
+        log_phase_complete(logger, 7)
+        return 0
 
-    # Select wordlist based on custom parameter or profile
-    if ffuf_wordlist is not None:
-        wordlist = ffuf_wordlist
-    elif profile == "standard":
-        wordlist = "common"
-    else:  # deep
-        wordlist = "medium"
+    # Ask user confirmation (unless --yes flag)
+    if not yes:
+        console.print(
+            f"\n[yellow]Nikto scans can take 5-30 minutes per endpoint ({len(httpx_results)} endpoints found)[/yellow]"
+        )
+        response = input("Run Nikto web server scan? [y/N]: ").strip().lower()
+        if response not in ["y", "yes"]:
+            logger.info("User skipped Nikto scan")
+            console.print("[dim]Skipping Nikto scan[/dim]")
+            log_phase_complete(logger, 7)
+            return 0
 
-    # Set time estimates based on wordlist
-    if wordlist == "common":
-        wordlist_size = "~4,700 entries"
-        time_estimate = "2-5 minutes"
-        max_time = 300
-    elif wordlist == "medium":
-        wordlist_size = "~220,000 entries"
-        time_estimate = "10-30 minutes"
-        max_time = 1800
-    elif wordlist == "large":
-        wordlist_size = "~1,000,000 entries"
-        time_estimate = "30-60 minutes"
-        max_time = 3600
-    else:
-        wordlist_size = "custom"
-        time_estimate = "varies"
-        max_time = 1800
+    # Build URL list
+    urls = [result.url for result in httpx_results]
 
-    total_endpoints = len(httpx_results)
+    # Initialize scanner
+    scanner = NiktoScanner()
 
-    console.print(
-        f"  [yellow]⚠️  FFuf fuzzing takes {time_estimate} per endpoint.[/yellow]"
+    # Execute Nikto with error handling
+    def run_nikto():
+        log_tool_execution(logger, "nikto", f"nikto {len(urls)} URLs")
+        return scanner.scan_urls(urls, profile=profile)
+
+    success, nikto_findings = safe_tool_execution(
+        func=run_nikto,
+        tool_name="nikto",
+        logger=logger,
+        max_retries=1,  # Nikto takes very long, only 1 retry
+        continue_on_error=True,
     )
-    console.print(f"  [yellow]Wordlist: {wordlist} ({wordlist_size})[/yellow]")
+
+    if not success:
+        logger.warning("Nikto failed - returning empty results")
+        log_phase_complete(logger, 7)
+        return 0
+
+    # Save Nikto findings
+    for finding in nikto_findings:
+        Finding.objects.create(
+            scan=scan,
+            title=finding["title"],
+            severity=finding["severity"],
+            description=finding["description"],
+            tool="nikto",
+            affected_url=finding["url"],
+        )
+
+    log_tool_success(logger, "nikto", len(nikto_findings))
     console.print(
-        f"  [yellow]Found {total_endpoints} HTTP endpoint(s) to fuzz.[/yellow]"
+        f"[bold]Phase 7 Results:[/bold] {len(nikto_findings)} web server vulnerabilities"
     )
 
-    # Ask user for confirmation (or auto-accept with --yes)
-    if yes:
-        run_ffuf = True
-        console.print("  [dim]Auto-accepting FFuf fuzzing (--yes flag)[/dim]")
-    else:
-        run_ffuf = typer.confirm("  Run FFuf directory fuzzing?", default=False)
-
-    if run_ffuf:
-        console.print(f"  [cyan]Starting FFuf fuzzing...[/cyan]")
-
-        for http_result in httpx_results:
-            console.print(f"  Fuzzing: {http_result.url}")
-
-            try:
-                # Run FFuf fuzzing
-                ffuf_findings = fuzz_directories(
-                    target=http_result.url,
-                    scan_id=scan.id,
-                    wordlist=wordlist,
-                    max_time=max_time,
-                    threads=20 if profile == "standard" else 40,
-                )
-
-                # Create Finding objects in database
-                for finding_data in ffuf_findings:
-                    Finding.objects.create(
-                        scan=scan,
-                        title=finding_data["title"],
-                        severity=finding_data["severity"],
-                        description=finding_data["description"],
-                        proof_of_concept=finding_data.get("proof_of_concept"),
-                        status="new",
-                        affected_url=http_result.url,
-                    )
-                    ffuf_findings_count += 1
-
-                if ffuf_findings:
-                    console.print(
-                        f"    [yellow]⚠️  Found {len(ffuf_findings)} hidden paths![/yellow]"
-                    )
-                else:
-                    console.print(f"    [green]✓ No hidden paths discovered[/green]")
-
-            except Exception as e:
-                console.print(
-                    f"    [yellow]Warning: FFuf failed for {http_result.url}: {str(e)}[/yellow]"
-                )
-                continue
-
-        if ffuf_findings_count > 0:
-            console.print(
-                f"\n[bold yellow]⚠️  FFuf discovered {ffuf_findings_count} hidden resources![/bold yellow]"
-            )
-    else:
-        console.print(f"  [dim]FFuf fuzzing skipped by user[/dim]")
-
-    return ffuf_findings_count
+    log_phase_complete(logger, 7)
+    return len(nikto_findings)
 
 
-def execute_phase_9_wpscan(scan, httpx_results, all_technologies, profile, yes=False):
+def execute_phase_8_ffuf_fuzzing(scan, httpx_results, profile, yes, ffuf_wordlist):
     """
-    Phase 9: WordPress Scanning with WPScan
-
-    Scans WordPress sites for vulnerable plugins, themes, and core.
-    Only runs if WordPress is detected in Phase 3.
+    Phase 8: FFuf Directory/File Fuzzing.
     """
-    import typer
-    from cli.utils.scanners.wpscan_scanner import scan_wordpress
+    from cli.utils.scanners.ffuf_fuzzer import FfufFuzzer
     from findings.models import Finding
 
-    wpscan_findings_count = 0
+    log_phase_start(logger, 8, "FFuf Directory Fuzzing")
 
-    # Check if WordPress was detected in Phase 3
-    wordpress_detected = False
+    if not httpx_results:
+        logger.info("No HTTP endpoints to fuzz - skipping FFuf")
+        console.print("[dim]No HTTP endpoints found - skipping FFuf[/dim]")
+        log_phase_complete(logger, 8)
+        return 0
+
+    # Skip FFuf for quick profile
+    if profile == "quick":
+        logger.info("Quick profile - skipping FFuf")
+        console.print("[dim]Quick profile - skipping FFuf[/dim]")
+        log_phase_complete(logger, 8)
+        return 0
+
+    # Ask user confirmation (unless --yes flag)
+    if not yes:
+        wordlist_size = "~4,700" if profile == "standard" else "~220,000"
+        console.print(
+            f"\n[yellow]FFuf fuzzing with {wordlist_size} wordlist can take 2-30 minutes per endpoint ({len(httpx_results)} endpoints found)[/yellow]"
+        )
+        response = input("Run FFuf directory fuzzing? [y/N]: ").strip().lower()
+        if response not in ["y", "yes"]:
+            logger.info("User skipped FFuf scan")
+            console.print("[dim]Skipping FFuf scan[/dim]")
+            log_phase_complete(logger, 8)
+            return 0
+
+    # Build URL list
+    urls = [result.url for result in httpx_results]
+
+    # Initialize fuzzer
+    fuzzer = FfufFuzzer()
+
+    # Execute FFuf with error handling
+    def run_ffuf():
+        log_tool_execution(logger, "ffuf", f"ffuf {len(urls)} URLs")
+        return fuzzer.fuzz_urls(urls, profile=profile, wordlist=ffuf_wordlist)
+
+    success, ffuf_findings = safe_tool_execution(
+        func=run_ffuf,
+        tool_name="ffuf",
+        logger=logger,
+        max_retries=1,  # FFuf takes long, only 1 retry
+        continue_on_error=True,
+    )
+
+    if not success:
+        logger.warning("FFuf failed - returning empty results")
+        log_phase_complete(logger, 8)
+        return 0
+
+    # Save FFuf findings
+    for finding in ffuf_findings:
+        Finding.objects.create(
+            scan=scan,
+            title=finding["title"],
+            severity=finding["severity"],
+            description=finding["description"],
+            tool="ffuf",
+            affected_url=finding["url"],
+        )
+
+    log_tool_success(logger, "ffuf", len(ffuf_findings))
+    console.print(
+        f"[bold]Phase 8 Results:[/bold] {len(ffuf_findings)} hidden paths discovered"
+    )
+
+    log_phase_complete(logger, 8)
+    return len(ffuf_findings)
+
+
+def execute_phase_9_wpscan(scan, httpx_results, all_technologies, profile, yes):
+    """
+    Phase 9: WordPress Scanning (conditional).
+    """
+    from cli.utils.scanners.wpscan_scanner import WPScanScanner
+    from findings.models import Finding
+
+    log_phase_start(logger, 9, "WordPress Scanning")
+
+    if not httpx_results:
+        logger.info("No HTTP endpoints to scan - skipping WPScan")
+        console.print("[dim]No HTTP endpoints found - skipping WPScan[/dim]")
+        log_phase_complete(logger, 9)
+        return 0
+
+    # Check if WordPress was detected
     wordpress_urls = []
-
-    for url, tech_data in all_technologies.items():
-        technologies = tech_data.get("technologies", {})
-        for tech_name in technologies.keys():
-            if "wordpress" in tech_name.lower():
-                wordpress_detected = True
+    for url, technologies in all_technologies.items():
+        for tech in technologies:
+            if "wordpress" in tech.lower():
                 wordpress_urls.append(url)
                 break
 
-    if wordpress_detected and profile in ["standard", "deep"]:
-        console.print(f"\n[cyan]Phase 9: WordPress scanning with WPScan...[/cyan]")
+    if not wordpress_urls:
+        logger.info("No WordPress sites detected - skipping WPScan")
+        console.print("[dim]No WordPress detected - skipping WPScan[/dim]")
+        log_phase_complete(logger, 9)
+        return 0
+
+    console.print(f"[cyan]WordPress detected on {len(wordpress_urls)} site(s)[/cyan]")
+
+    # Ask user confirmation (unless --yes flag)
+    if not yes:
         console.print(
-            f"  [green]✓ WordPress detected on {len(wordpress_urls)} endpoint(s)[/green]"
+            f"\n[yellow]WPScan can take 5-20 minutes per WordPress site ({len(wordpress_urls)} found)[/yellow]"
+        )
+        response = input("Run WPScan WordPress security scan? [y/N]: ").strip().lower()
+        if response not in ["y", "yes"]:
+            logger.info("User skipped WPScan")
+            console.print("[dim]Skipping WPScan[/dim]")
+            log_phase_complete(logger, 9)
+            return 0
+
+    # Initialize scanner
+    scanner = WPScanScanner()
+
+    # Execute WPScan with error handling
+    def run_wpscan():
+        log_tool_execution(
+            logger, "wpscan", f"wpscan {len(wordpress_urls)} WordPress sites"
+        )
+        return scanner.scan_wordpress_sites(wordpress_urls, profile=profile)
+
+    success, wpscan_findings = safe_tool_execution(
+        func=run_wpscan,
+        tool_name="wpscan",
+        logger=logger,
+        max_retries=1,  # WPScan takes long, only 1 retry
+        continue_on_error=True,
+    )
+
+    if not success:
+        logger.warning("WPScan failed - returning empty results")
+        log_phase_complete(logger, 9)
+        return 0
+
+    # Save WPScan findings
+    for finding in wpscan_findings:
+        Finding.objects.create(
+            scan=scan,
+            title=finding["title"],
+            severity=finding["severity"],
+            description=finding["description"],
+            tool="wpscan",
+            affected_url=finding["url"],
         )
 
-        console.print(
-            f"  [yellow]⚠️  WPScan takes 5-10 minutes per WordPress site.[/yellow]"
-        )
+    log_tool_success(logger, "wpscan", len(wpscan_findings))
+    console.print(
+        f"[bold]Phase 9 Results:[/bold] {len(wpscan_findings)} WordPress vulnerabilities"
+    )
 
-        # Ask user for confirmation (or auto-accept with --yes)
-        if yes:
-            run_wpscan = True
-            console.print("  [dim]Auto-accepting WPScan (--yes flag)[/dim]")
-        else:
-            run_wpscan = typer.confirm(
-                "  Run WPScan WordPress security scan?", default=False
-            )
-
-        if run_wpscan:
-            console.print(
-                f"  [cyan]Starting WPScan (scanning plugins, themes, core)...[/cyan]"
-            )
-
-            for wp_url in wordpress_urls:
-                console.print(f"  Scanning: {wp_url}")
-
-                try:
-                    # Run WPScan
-                    wpscan_findings = scan_wordpress(
-                        target=wp_url,
-                        scan_id=scan.id,
-                        enumerate="vp,vt,u",  # Vulnerable plugins, themes, users
-                        timeout=600,  # 10 minutes
-                    )
-
-                    # Create Finding objects in database
-                    for finding_data in wpscan_findings:
-                        Finding.objects.create(
-                            scan=scan,
-                            title=finding_data["title"],
-                            severity=finding_data["severity"],
-                            description=finding_data["description"],
-                            proof_of_concept=finding_data.get("proof_of_concept"),
-                            status="new",
-                            affected_url=wp_url,
-                        )
-                        wpscan_findings_count += 1
-
-                    if wpscan_findings:
-                        console.print(
-                            f"    [red]⚠️  Found {len(wpscan_findings)} WordPress vulnerabilities![/red]"
-                        )
-                    else:
-                        console.print(
-                            f"    [green]✓ No WordPress vulnerabilities found[/green]"
-                        )
-
-                except Exception as e:
-                    console.print(
-                        f"    [yellow]Warning: WPScan failed for {wp_url}: {str(e)}[/yellow]"
-                    )
-                    continue
-
-            if wpscan_findings_count > 0:
-                console.print(
-                    f"\n[bold red]🚨 CRITICAL: {wpscan_findings_count} WordPress vulnerabilities detected![/bold red]"
-                )
-        else:
-            console.print(f"  [dim]WPScan skipped by user[/dim]")
-
-    elif wordpress_detected and profile == "quick":
-        console.print(
-            f"\n[dim]WordPress detected but WPScan skipped in quick profile (use --profile standard)[/dim]"
-        )
-    else:
-        console.print(f"\n[dim]No WordPress detected - skipping WPScan[/dim]")
-
-    return wpscan_findings_count
+    log_phase_complete(logger, 9)
+    return len(wpscan_findings)
