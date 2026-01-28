@@ -127,7 +127,13 @@ class Finding(models.Model):
     http_response = models.TextField(
         blank=True, help_text="Raw HTTP response showing the vulnerability"
     )
-
+    # Extra structured data (JSON) - tool-specific details
+    extra_data = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Additional structured data from security tools (JSON format). "
+        "Examples: SQLMap databases/tables, nuclei matched patterns, etc.",
+    )
     # Tool that discovered this finding
     discovered_by = models.CharField(
         max_length=100,

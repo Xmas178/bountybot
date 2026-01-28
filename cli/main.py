@@ -11,6 +11,7 @@ import django
 import typer
 from rich.console import Console
 from pathlib import Path
+from cli.commands.delete import main as delete_cmd
 
 # Initialize Rich console for pretty output
 console = Console()
@@ -53,6 +54,18 @@ app.add_typer(target.app, name="target")
 app.add_typer(scan.app, name="scan")
 app.add_typer(finding.app, name="finding")
 app.add_typer(analyze.app, name="analyze")
+
+
+# Delete command (inline, not a separate typer app)
+@app.command()
+def delete(
+    target: int = typer.Option(None, "--target", "-t", help="Delete target by ID"),
+    scan: int = typer.Option(None, "--scan", "-s", help="Delete scan by ID"),
+    finding: int = typer.Option(None, "--finding", "-f", help="Delete finding by ID"),
+    all: bool = typer.Option(False, "--all", "-a", help="Delete ALL data"),
+):
+    """Delete targets, scans, or findings from database."""
+    delete_cmd(target=target, scan=scan, finding=finding, all=all)
 
 
 @app.command()

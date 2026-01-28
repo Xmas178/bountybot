@@ -18,6 +18,7 @@ import re
 from pathlib import Path
 from typing import List, Dict, Optional
 from cli.utils.config import get_output_dir
+from cli.utils.parsers import SQLMapParser
 
 
 def test_sql_injection(
@@ -93,6 +94,7 @@ def test_sql_injection(
         # S = Stacked queries
         # T = Time-based blind
         # Q = Inline queries
+        "--dump-format=JSON",  # Output dumps in JSON format for parsing
     ]
     # Add DBMS if detected from WhatWeb
     if dbms:
@@ -122,8 +124,19 @@ def test_sql_injection(
         if output_file.exists():
             findings = parse_sqlmap_output(output_file, target, scan_id)
 
+            # Parse structured data with SQLMapParser
+            parser = SQLMapParser(output_dir)
+            structured_data = parser.parse_full_output()
+
+            # Add structured data to findings
+            if structured_data and findings:
+                for finding in findings:
+                    finding["extra_data"] = structured_data
+
             if findings:
                 print(f"[+] Found {len(findings)} SQL injection vulnerabilities!")
+                if structured_data and structured_data.get("databases"):
+                    print(f"[+] Discovered {len(structured_data['databases'])} databases")
             else:
                 print(f"[*] No SQL injection vulnerabilities detected")
 
@@ -131,13 +144,6 @@ def test_sql_injection(
         else:
             print(f"[!] No SQLMap output file generated")
             return []
-
-    except subprocess.TimeoutExpired:
-        print(f"[!] SQLMap scan timed out after {timeout} seconds")
-        return []
-    except Exception as e:
-        print(f"[!] Error running SQLMap: {e}")
-        return []
 
 
 def parse_sqlmap_output(output_file: Path, target: str, scan_id: int) -> List[Dict]:

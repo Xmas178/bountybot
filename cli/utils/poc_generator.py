@@ -97,6 +97,39 @@ class PoCGenerator:
     def _build_python_prompt(self, finding) -> str:
         """Build prompt for Python PoC generation with strict safety controls."""
 
+        # Extract extra_data if available (e.g., SQLMap databases/tables)
+        extra_info = ""
+        if finding.extra_data:
+            extra_info = "\nADDITIONAL STRUCTURED DATA:\n"
+
+            # SQLMap-specific data
+            if "databases" in finding.extra_data and finding.extra_data["databases"]:
+                extra_info += (
+                    f"- Databases found: {', '.join(finding.extra_data['databases'])}\n"
+                )
+
+            if "tables" in finding.extra_data and finding.extra_data["tables"]:
+                extra_info += "- Tables found:\n"
+                for db, tables in finding.extra_data["tables"].items():
+                    extra_info += f"  * {db}: {', '.join(tables)}\n"
+
+            if "columns" in finding.extra_data and finding.extra_data["columns"]:
+                extra_info += "- Columns found:\n"
+                for db, tables in finding.extra_data["columns"].items():
+                    for table, columns in tables.items():
+                        extra_info += f"  * {db}.{table}: {', '.join(columns)}\n"
+
+            if "injection_details" in finding.extra_data:
+                inj = finding.extra_data["injection_details"]
+                if inj.get("technique"):
+                    extra_info += f"- Injection technique: {inj['technique']}\n"
+                if inj.get("payloads"):
+                    extra_info += (
+                        f"- Working payloads: {inj['payloads'][:2]}\n"  # First 2 only
+                    )
+                if inj.get("dbms"):
+                    extra_info += f"- Backend DBMS: {inj['dbms']}\n"
+
         return f"""Generate a Python proof-of-concept script for this security finding:
 
 FINDING DETAILS:
@@ -106,7 +139,7 @@ FINDING DETAILS:
 - Description: {finding.description}
 - Affected URL: {finding.affected_url or 'N/A'}
 - Affected Parameter: {finding.affected_parameter or 'N/A'}
-- Tool: {finding.discovered_by or 'N/A'}
+- Tool: {finding.discovered_by or 'N/A'}{extra_info}
 
 STRICT SAFETY REQUIREMENTS - MANDATORY:
 
@@ -145,6 +178,14 @@ PYTHON REQUIREMENTS:
 6. Handle errors gracefully
 7. Return ONLY Python code (no markdown fences)
 8. Start with shebang: #!/usr/bin/env python3
+
+{f'''SQLMap-SPECIFIC PoC REQUIREMENTS:
+- Show how SQLMap found the injection point
+- Demonstrate manual SQL injection payload construction
+- If databases found, show how to enumerate them manually
+- If tables found, show SELECT statement examples
+- DO NOT actually dump data - only show the TECHNIQUE
+- Focus on demonstrating the vulnerability, not exploiting it''' if finding.extra_data and 'databases' in finding.extra_data else ''}
 
 RESPONSE FORMAT:
 - Return ONLY the Python code
@@ -259,10 +300,43 @@ FORMAT:
 - Educational purpose only
 """
 
-    def _build_report_prompt(self, finding) -> str:
-        """Build prompt for HackerOne report generation."""
+    def _build_python_prompt(self, finding) -> str:
+        """Build prompt for Python PoC generation with strict safety controls."""
 
-        return f"""Generate a professional bug bounty report for this finding:
+        # Extract extra_data if available (e.g., SQLMap databases/tables)
+        extra_info = ""
+        if finding.extra_data:
+            extra_info = "\nADDITIONAL STRUCTURED DATA:\n"
+
+            # SQLMap-specific data
+            if "databases" in finding.extra_data and finding.extra_data["databases"]:
+                extra_info += (
+                    f"- Databases found: {', '.join(finding.extra_data['databases'])}\n"
+                )
+
+            if "tables" in finding.extra_data and finding.extra_data["tables"]:
+                extra_info += "- Tables found:\n"
+                for db, tables in finding.extra_data["tables"].items():
+                    extra_info += f"  * {db}: {', '.join(tables)}\n"
+
+            if "columns" in finding.extra_data and finding.extra_data["columns"]:
+                extra_info += "- Columns found:\n"
+                for db, tables in finding.extra_data["columns"].items():
+                    for table, columns in tables.items():
+                        extra_info += f"  * {db}.{table}: {', '.join(columns)}\n"
+
+            if "injection_details" in finding.extra_data:
+                inj = finding.extra_data["injection_details"]
+                if inj.get("technique"):
+                    extra_info += f"- Injection technique: {inj['technique']}\n"
+                if inj.get("payloads"):
+                    extra_info += (
+                        f"- Working payloads: {inj['payloads'][:2]}\n"  # First 2 only
+                    )
+                if inj.get("dbms"):
+                    extra_info += f"- Backend DBMS: {inj['dbms']}\n"
+
+        return f"""Generate a Python proof-of-concept script for this security finding:
 
 FINDING DETAILS:
 - Title: {finding.title}
@@ -270,44 +344,71 @@ FINDING DETAILS:
 - Category: {finding.category}
 - Description: {finding.description}
 - Affected URL: {finding.affected_url or 'N/A'}
-- Parameter: {finding.affected_parameter or 'N/A'}
-- PoC: {finding.proof_of_concept or 'N/A'}
+- Affected Parameter: {finding.affected_parameter or 'N/A'}
+- Tool: {finding.discovered_by or 'N/A'}{extra_info}
 
-REPORT REQUIREMENTS:
+STRICT SAFETY REQUIREMENTS - MANDATORY:
 
-1. Follow HackerOne report format
-2. Include:
-   - Summary (2-3 sentences)
-   - Vulnerability Details
-   - Steps to Reproduce (numbered, specific)
-   - Impact Analysis (business and technical)
-   - Remediation Recommendations
-   - CVSS Score estimation with justification
+1. ABSOLUTELY FORBIDDEN (NEVER INCLUDE):
+   - Brute force loops (for password in passwords)
+   - Multiple authentication attempts
+   - Password wordlists or credential testing
+   - DoS/resource exhaustion (no infinite loops, no large iterations)
+   - Data destruction (no DELETE, DROP, rm -rf)
+   - Automated fuzzing loops (max 3-5 manual test cases)
+   - Any form of "while True" or iteration over large datasets
 
-3. Professional tone
-4. Clear and concise
-5. Include severity justification
-6. Focus on business impact
+2. SINGLE REQUEST RULE:
+   - Maximum 1 HTTP request per endpoint
+   - If testing multiple inputs, use 3-5 manual examples (NOT loops)
+   - NO iteration over wordlists or parameter lists
 
-FORMAT:
-- Return as Markdown
-- NO code fences around entire document
-- Use proper Markdown headers (##)
-- Include all required sections
-- Maximum 500 lines
+3. PASSIVE RECONNAISSANCE ONLY:
+   - DNS queries are OK
+   - Single HTTP GET/POST is OK
+   - Header analysis is OK
+   - Content inspection is OK
 
-Note: This is a report template, not executable code.
-No safety restrictions needed for report format.
+4. EDUCATIONAL PURPOSE:
+   - Script demonstrates vulnerability EXISTS
+   - NOT designed for exploitation
+   - Clear TODO markers for manual testing
+   - Explain each step in comments
+
+PYTHON REQUIREMENTS:
+1. Python 3.12+ compatible
+2. Use requests library for HTTP
+3. Include comprehensive English comments
+4. Add ethical disclaimer at top
+5. Print results clearly
+6. Handle errors gracefully
+7. Return ONLY Python code (no markdown fences)
+8. Start with shebang: #!/usr/bin/env python3
+
+{f'''SQLMap-SPECIFIC PoC REQUIREMENTS:
+- Show how SQLMap found the injection point
+- Demonstrate manual SQL injection payload construction
+- If databases found, show how to enumerate them manually
+- If tables found, show SELECT statement examples
+- DO NOT actually dump data - only show the TECHNIQUE
+- Focus on demonstrating the vulnerability, not exploiting it''' if finding.extra_data and 'databases' in finding.extra_data else ''}
+
+RESPONSE FORMAT:
+- Return ONLY the Python code
+- NO markdown code fences
+- Include docstring explaining vulnerability
+- Maximum 200 lines of code
+- Focus on DEMONSTRATION, not exploitation
+
+Example structure:
+#!/usr/bin/env python3
+\"\"\"[Vulnerability explanation]\"\"\"
+import requests
+# [Ethical disclaimer]
+# [Configuration]
+# [Single test function]
+# [Output results]
 """
-
-    def _call_claude(self, prompt: str) -> str:
-        """Call Claude API and return response."""
-        message = self.client.messages.create(
-            model=self.model,
-            max_tokens=4000,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return message.content[0].text
 
     def _validate_poc_safety(self, code: str, extension: str) -> bool:
         """
@@ -324,20 +425,20 @@ No safety restrictions needed for report format.
             ValueError: If dangerous pattern detected
         """
         # Skip validation for reports (markdown)
-        if extension == 'md':
+        if extension == "md":
             return True
 
         # Dangerous patterns that should NEVER appear in PoCs
         dangerous_patterns = {
-            r'for\s+\w+\s+in\s+.*password': 'Password brute force loop detected',
-            r'while\s+True': 'Infinite loop detected',
-            r'range\s*\(\s*[1-9]\d{2,}': 'Large iteration loop detected (100+ iterations)',
-            r'hydra|medusa|john': 'Brute force tool reference detected',
-            r'rm\s+-rf|DROP\s+TABLE|DELETE\s+FROM': 'Destructive operation detected',
-            r'for\s+\w+\s+in\s+.*wordlist': 'Wordlist iteration detected',
-            r'&\s*$|;\s*$.*&': 'Background process/fork bomb pattern',
-            r':\(\)\{.*:\|:': 'Fork bomb detected',
-            r'curl.*--data.*password.*for': 'Authentication brute force detected',
+            r"for\s+\w+\s+in\s+.*password": "Password brute force loop detected",
+            r"while\s+True": "Infinite loop detected",
+            r"range\s*\(\s*[1-9]\d{2,}": "Large iteration loop detected (100+ iterations)",
+            r"hydra|medusa|john": "Brute force tool reference detected",
+            r"rm\s+-rf|DROP\s+TABLE|DELETE\s+FROM": "Destructive operation detected",
+            r"for\s+\w+\s+in\s+.*wordlist": "Wordlist iteration detected",
+            r"&\s*$|;\s*$.*&": "Background process/fork bomb pattern",
+            r":\(\)\{.*:\|:": "Fork bomb detected",
+            r"curl.*--data.*password.*for": "Authentication brute force detected",
         }
 
         # Check each pattern
@@ -351,8 +452,10 @@ No safety restrictions needed for report format.
                 )
 
         # Count HTTP requests (should be minimal)
-        http_request_count = len(re.findall(r'requests\.(get|post|put|delete|patch)', code, re.IGNORECASE))
-        http_request_count += len(re.findall(r'curl\s+', code, re.IGNORECASE))
+        http_request_count = len(
+            re.findall(r"requests\.(get|post|put|delete|patch)", code, re.IGNORECASE)
+        )
+        http_request_count += len(re.findall(r"curl\s+", code, re.IGNORECASE))
 
         if http_request_count > 10:
             raise ValueError(
