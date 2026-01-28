@@ -211,6 +211,95 @@ def show_finding(
         raise typer.Exit(code=1)
 
 
+@app.command("deduplicate")
+def deduplicate_findings(
+    scan: int = typer.Option(..., "--scan", "-s", help="Scan ID to deduplicate"),
+    threshold: float = typer.Option(
+        0.85, "--threshold", "-t", help="Similarity threshold (0.0-1.0)"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Preview duplicates without marking"
+    ),
+):
+    """
+    Find and mark duplicate findings in a scan.
+
+    Identifies similar findings based on severity, category, URL, and text similarity.
+    Keeps the first finding in each duplicate group as original.
+    """
+    from cli.utils.deduplicator import FindingDeduplicator
+    from rich.table import Table
+    from scans.models import Scan
+
+    console = Console()
+
+    # Validate scan exists
+    try:
+        scan_obj = Scan.objects.get(id=scan)
+    except Scan.DoesNotExist:
+        console.print(f"[red]Error: Scan #{scan} not found[/red]")
+        raise typer.Exit(1)
+
+    deduplicator = FindingDeduplicator(similarity_threshold=threshold)
+
+    if dry_run:
+        # Preview mode - don't modify data
+        console.print(
+            f"\n[yellow]DRY RUN: Preview duplicate detection for Scan #{scan}[/yellow]"
+        )
+        console.print(f"Similarity threshold: {threshold:.0%}\n")
+
+        stats = deduplicator.get_duplicate_stats(scan)
+
+        console.print(f"[cyan]Total findings:[/cyan] {stats['total']}")
+        console.print(
+            f"[cyan]Already marked duplicate:[/cyan] {stats['already_marked']}"
+        )
+        console.print(
+            f"[yellow]Potential duplicates:[/yellow] {stats['potential_duplicates']}"
+        )
+        console.print(f"[cyan]Duplicate groups:[/cyan] {stats['groups']}")
+
+        console.print(f"\n[dim]Run without --dry-run to mark duplicates[/dim]")
+
+    else:
+        # Actual deduplication
+        console.print(f"\n[cyan]Deduplicating findings for Scan #{scan}...[/cyan]")
+        console.print(f"Similarity threshold: {threshold:.0%}\n")
+
+        with console.status("[cyan]Finding duplicates..."):
+            result = deduplicator.deduplicate_scan(scan)
+
+        # Display results
+        console.print(f"✓ [green]Deduplication complete[/green]\n")
+
+        # Statistics table
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("Metric", style="cyan")
+        table.add_column("Count", justify="right", style="white")
+
+        table.add_row("Total findings", str(result["total"]))
+        table.add_row("Unique findings", f"[green]{result['unique']}[/green]")
+        table.add_row("Duplicates marked", f"[yellow]{result['duplicates']}[/yellow]")
+        table.add_row("Duplicate groups", str(len(result["groups"])))
+
+        console.print(table)
+
+        # Show duplicate groups
+        if result["groups"]:
+            console.print(f"\n[cyan]Duplicate Groups:[/cyan]")
+            for i, group in enumerate(result["groups"], 1):
+                original = group[0]
+                duplicates = group[1:]
+                console.print(
+                    f"  {i}. Finding #{original} (original) + {len(duplicates)} duplicate(s): {duplicates}"
+                )
+
+        console.print(
+            f"\n[dim]View unique findings: bountybot finding list --scan {scan} --status new[/dim]"
+        )
+
+
 @app.command("generate-poc")
 def generate_poc(
     finding_id: int = typer.Argument(..., help="Finding ID to generate PoC for"),
